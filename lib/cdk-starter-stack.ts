@@ -1,15 +1,29 @@
-import * as apiGateway from '@aws-cdk/aws-apigatewayv2-alpha';
-import * as apiGatewayAuthorizers from '@aws-cdk/aws-apigatewayv2-authorizers-alpha';
-import * as apiGatewayIntegrations from '@aws-cdk/aws-apigatewayv2-integrations-alpha';
+import * as apiGateway from 'aws-cdk-lib/aws-apigateway';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
-import {NodejsFunction} from 'aws-cdk-lib/aws-lambda-nodejs';
+import * as route53 from 'aws-cdk-lib/aws-route53';
+import * as router53Targets from 'aws-cdk-lib/aws-route53-targets';
 import * as cdk from 'aws-cdk-lib';
+import * as iam from 'aws-cdk-lib/aws-iam';
 import * as path from 'path';
+import {
+  Certificate,
+  CertificateValidation,
+} from 'aws-cdk-lib/aws-certificatemanager';
+import {SecurityPolicy} from 'aws-cdk-lib/aws-apigateway';
+import {NodejsFunction} from 'aws-cdk-lib/aws-lambda-nodejs';
+import CognitoAuthRole from './cognito-auth-role';
+
+interface Props extends cdk.StackProps {
+  domainName: string;
+}
 
 export class CdkStarterStack extends cdk.Stack {
-  constructor(scope: cdk.App, id: string, props?: cdk.StackProps) {
+  constructor(scope: cdk.App, id: string, props: Props) {
     super(scope, id, props);
+
+    const apiDomainName = `mp.${props.domainName}`;
+    const timestreamDatabaseName = 'FacialExpression';
 
     // 👇 create the user pool
     const userPool = new cognito.UserPool(this, 'userpool', {
@@ -42,36 +56,104 @@ export class CdkStarterStack extends cdk.Stack {
       ],
     });
 
+    const identityPool = new cognito.CfnIdentityPool(this, 'identity-pool', {
+      allowUnauthenticatedIdentities: false,
+      cognitoIdentityProviders: [
+        {
+          clientId: userPoolClient.userPoolClientId,
+          providerName: userPool.userPoolProviderName,
+        },
+      ],
+    });
+
+    const authRole = new CognitoAuthRole(this, 'cognito-auth-role', {
+      identityPool,
+    });
+
+    const policyDocument = {
+      Version: '2012-10-17',
+      Statement: [
+        {
+          Effect: 'Allow',
+          Action: ['timestream:DescribeEndpoints'],
+          Resource: '*',
+        },
+        {
+          Effect: 'Allow',
+          Action: ['timestream:Select'],
+          Resource: `arn:aws:timestream:${props.env?.region}:${props.env?.account}:database/${timestreamDatabaseName}/table/*`,
+        },
+      ],
+    };
+
     // 👇 create the lambda that sits behind the authorizer
-    const lambdaFunction = new NodejsFunction(this, 'my-function', {
+    const queryGraph = new NodejsFunction(this, 'query-graph', {
       runtime: lambda.Runtime.NODEJS_14_X,
       handler: 'main',
-      entry: path.join(__dirname, `/../src/protected-function/index.ts`),
+      entry: path.join(__dirname, `/../src/graphs/index.ts`),
+    });
+
+    queryGraph.role?.addManagedPolicy(
+      iam.ManagedPolicy.fromManagedPolicyName(
+        this,
+        'query-graph-lambda',
+        authRole.queryGraphPolicyName,
+      ),
+    );
+
+    const queryBooks = new NodejsFunction(this, 'query-book', {
+      runtime: lambda.Runtime.NODEJS_14_X,
+      handler: 'main',
+      entry: path.join(__dirname, `/../src/books/index.ts`),
+    });
+
+    // 👇 Get hosted zone
+    const hostedZone = route53.HostedZone.fromLookup(this, 'hosted-zone', {
+      domainName: props.domainName,
+    });
+
+    const certificate = new Certificate(this, 'certificate', {
+      domainName: `*.${props.domainName}`,
+      validation: CertificateValidation.fromDns(hostedZone),
     });
 
     // 👇 create the API
-    const httpApi = new apiGateway.HttpApi(this, 'api', {
-      apiName: `my-api`,
+    const restApi = new apiGateway.RestApi(this, 'api', {
+      restApiName: 'my-api',
+      domainName: {
+        certificate,
+        domainName: apiDomainName,
+        securityPolicy: SecurityPolicy.TLS_1_2,
+      },
+    });
+
+    new route53.ARecord(this, 'api-record', {
+      recordName: apiDomainName,
+      zone: hostedZone,
+      target: route53.RecordTarget.fromAlias(
+        new router53Targets.ApiGateway(restApi),
+      ),
     });
 
     // 👇 create the Authorizer
-    const authorizer = new apiGatewayAuthorizers.HttpUserPoolAuthorizer(
+    const authorizer = new apiGateway.CognitoUserPoolsAuthorizer(
+      this,
       'user-pool-authorizer',
-      userPool,
       {
-        userPoolClients: [userPoolClient],
-        identitySource: ['$request.header.Authorization'],
+        cognitoUserPools: [userPool],
       },
     );
 
-    // 👇 set the Authorizer on the Route
-    httpApi.addRoutes({
-      integration: new apiGatewayIntegrations.HttpLambdaIntegration(
-        'protected-fn-integration',
-        lambdaFunction,
-      ),
-      path: '/protected',
+    const graphs = restApi.root.addResource('graphs');
+    graphs.addMethod('GET', new apiGateway.LambdaIntegration(queryGraph), {
       authorizer,
+      authorizationType: apiGateway.AuthorizationType.COGNITO,
+    });
+
+    const books = restApi.root.addResource('books');
+    books.addMethod('GET', new apiGateway.LambdaIntegration(queryBooks), {
+      authorizer,
+      authorizationType: apiGateway.AuthorizationType.COGNITO,
     });
 
     new cdk.CfnOutput(this, 'region', {value: cdk.Stack.of(this).region});
@@ -80,8 +162,7 @@ export class CdkStarterStack extends cdk.Stack {
       value: userPoolClient.userPoolClientId,
     });
     new cdk.CfnOutput(this, 'apiUrl', {
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-      value: httpApi.url!,
+      value: restApi.url!,
     });
   }
 }
