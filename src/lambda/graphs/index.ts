@@ -9,6 +9,10 @@ const client = new TimestreamQueryClient({
   region: 'eu-central-1',
 });
 
+enum graphType {
+  AREA_SCORE = 'area_score',
+}
+
 export async function main(
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> {

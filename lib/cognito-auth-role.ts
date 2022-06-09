@@ -67,6 +67,12 @@ export default class CognitoAuthRole extends cdk.Resource {
             resources: [
               `arn:aws:timestream:${scope.region}:${scope.account}:database/${timestreamDatabaseName}/table/*`,
             ],
+            conditions: {
+              StringLikeIfExists: {
+                'aws:ResourceTag/TagKey/companyId':
+                  '${aws:PrincipalTag/companyIds}',
+              },
+            },
           }),
         ],
       }),

@@ -13,6 +13,7 @@ import {
 import {SecurityPolicy} from 'aws-cdk-lib/aws-apigateway';
 import {NodejsFunction} from 'aws-cdk-lib/aws-lambda-nodejs';
 import CognitoAuthRole from './cognito-auth-role';
+import {Duration} from 'aws-cdk-lib';
 
 interface Props extends cdk.StackProps {
   domainName: string;
@@ -39,16 +40,29 @@ export class CdkStarterStack extends cdk.Stack {
         requireUppercase: false,
         requireSymbols: false,
       },
+      customAttributes: {
+        companies: new cognito.StringAttribute({
+          mutable: true,
+        }),
+      },
       accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
+
+      lambdaTriggers: {
+        preTokenGeneration: new NodejsFunction(this, 'pre-token-generator', {
+          runtime: lambda.Runtime.NODEJS_14_X,
+          handler: 'main',
+          entry: path.join(
+            __dirname,
+            `/../src/lambda/preTokenTrigger/index.ts`,
+          ),
+        }),
+      },
     });
 
     // 👇 create the user pool client
     const userPoolClient = new cognito.UserPoolClient(this, 'userpool-client', {
       userPool,
       authFlows: {
-        adminUserPassword: true,
-        userPassword: true,
-        custom: true,
         userSrp: true,
       },
       supportedIdentityProviders: [
@@ -70,27 +84,12 @@ export class CdkStarterStack extends cdk.Stack {
       identityPool,
     });
 
-    const policyDocument = {
-      Version: '2012-10-17',
-      Statement: [
-        {
-          Effect: 'Allow',
-          Action: ['timestream:DescribeEndpoints'],
-          Resource: '*',
-        },
-        {
-          Effect: 'Allow',
-          Action: ['timestream:Select'],
-          Resource: `arn:aws:timestream:${props.env?.region}:${props.env?.account}:database/${timestreamDatabaseName}/table/*`,
-        },
-      ],
-    };
-
     // 👇 create the lambda that sits behind the authorizer
     const queryGraph = new NodejsFunction(this, 'query-graph', {
       runtime: lambda.Runtime.NODEJS_14_X,
       handler: 'main',
-      entry: path.join(__dirname, `/../src/graphs/index.ts`),
+      entry: path.join(__dirname, `/../src/lambda/graphs/index.ts`),
+      timeout: Duration.seconds(30),
     });
 
     queryGraph.role?.addManagedPolicy(
@@ -104,8 +103,33 @@ export class CdkStarterStack extends cdk.Stack {
     const queryBooks = new NodejsFunction(this, 'query-book', {
       runtime: lambda.Runtime.NODEJS_14_X,
       handler: 'main',
-      entry: path.join(__dirname, `/../src/books/index.ts`),
+      entry: path.join(__dirname, `/../src/lambda/books/index.ts`),
     });
+
+    const getProfile = new NodejsFunction(this, 'get-profile', {
+      runtime: lambda.Runtime.NODEJS_14_X,
+      handler: 'main',
+      entry: path.join(__dirname, `/../src/lambda/profile/index.ts`),
+    });
+
+    const refreshSession = new NodejsFunction(this, 'refresh-token', {
+      runtime: lambda.Runtime.NODEJS_14_X,
+      handler: 'main',
+      entry: path.join(__dirname, `/../src/lambda/refresh-session/index.ts`),
+    });
+
+    refreshSession.role?.addManagedPolicy(
+      new iam.ManagedPolicy(this, 'refresh-token-lambda', {
+        managedPolicyName: 'refresh-token-lambda',
+        statements: [
+          new iam.PolicyStatement({
+            actions: ['cognito-idp:AdminInitiateAuth'],
+            resources: [userPool.userPoolArn],
+            effect: iam.Effect.ALLOW,
+          }),
+        ],
+      }),
+    );
 
     // 👇 Get hosted zone
     const hostedZone = route53.HostedZone.fromLookup(this, 'hosted-zone', {
@@ -120,6 +144,18 @@ export class CdkStarterStack extends cdk.Stack {
     // 👇 create the API
     const restApi = new apiGateway.RestApi(this, 'api', {
       restApiName: 'my-api',
+      defaultCorsPreflightOptions: {
+        allowOrigins: ['http://local.sandbox.predictablexp.com:4444'],
+        allowHeaders: [
+          'Content-Type',
+          'Content-Length',
+          'Authorization',
+          'Accept',
+          'X-Requested-With',
+          'X-API-KEY',
+        ],
+        allowCredentials: true,
+      },
       domainName: {
         certificate,
         domainName: apiDomainName,
@@ -156,6 +192,44 @@ export class CdkStarterStack extends cdk.Stack {
       authorizationType: apiGateway.AuthorizationType.COGNITO,
     });
 
+    const profile = restApi.root.addResource('profile');
+    profile.addMethod('GET', new apiGateway.LambdaIntegration(getProfile), {
+      authorizer,
+      authorizationType: apiGateway.AuthorizationType.COGNITO,
+    });
+    const profileRefreshSession = profile.addResource('refresh-session');
+    profileRefreshSession.addMethod(
+      'POST',
+      new apiGateway.LambdaIntegration(refreshSession),
+      {
+        authorizer,
+        authorizationType: apiGateway.AuthorizationType.COGNITO,
+        requestValidatorOptions: {
+          validateRequestBody: true,
+        },
+        requestModels: {
+          'application/json': new apiGateway.Model(
+            this,
+            'refresh-token-model',
+            {
+              restApi,
+              schema: {
+                type: apiGateway.JsonSchemaType.OBJECT,
+                properties: {
+                  companyId: {
+                    type: apiGateway.JsonSchemaType.STRING,
+                  },
+                  refreshToken: {
+                    type: apiGateway.JsonSchemaType.STRING,
+                  },
+                },
+                required: ['companyId', 'refreshToken'],
+              },
+            },
+          ),
+        },
+      },
+    );
     new cdk.CfnOutput(this, 'region', {value: cdk.Stack.of(this).region});
     new cdk.CfnOutput(this, 'userPoolId', {value: userPool.userPoolId});
     new cdk.CfnOutput(this, 'userPoolClientId', {
